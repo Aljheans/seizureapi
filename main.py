@@ -352,12 +352,33 @@ async def get_all_seizure_events(current_user=Depends(get_current_user)):
     )
     return [{"timestamp": r["timestamp"].isoformat(), "device_ids": r["device_ids"].split(",")} for r in rows]
 
+
+class DevicePayload(BaseModel):
+    device_id: str
+    timestamp_ms: int
+    sensors: dict
+    seizure_flag: bool = False
+
 @app.post("/")
 async def root_post(payload: DevicePayload):
     """
     Accept device data directly at root URL for ESP32 (no auth required).
+    Only registered device_ids are allowed to store data.
     """
-    return await receive_device_data(payload)
+    # Check if device_id exists in devices table
+    device_row = await database.fetch_one(devices.select().where(devices.c.device_id == payload.device_id))
+    if not device_row:
+        raise HTTPException(status_code=403, detail="Device not registered")
+
+    # Save payload to database
+    ts = datetime.utcfromtimestamp(payload.timestamp_ms / 1000.0)
+    await database.execute(device_data.insert().values(
+        device_id=payload.device_id,
+        timestamp=ts,
+        payload=json.dumps(payload.dict())
+    ))
+
+    return {"status": "ok"}
 
 # ================== RUN APP ==================
 if __name__ == "__main__":
