@@ -10,7 +10,7 @@ import os
 import json
 from fastapi.middleware.cors import CORSMiddleware
 
-
+# ================== DATABASE CONFIG ==================
 if "DATABASE_URL" in os.environ:
     raw_url = os.environ["DATABASE_URL"]
     if raw_url.startswith("postgres://"):
@@ -31,7 +31,7 @@ engine = sqlalchemy.create_engine(
 
 app = FastAPI(title="Seizure Monitor Backend")
 
-
+# ================== TABLES ==================
 users = sqlalchemy.Table(
     "users", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
@@ -66,12 +66,13 @@ seizure_events = sqlalchemy.Table(
 
 metadata.create_all(engine)
 
+# ================== AUTH CONFIG ==================
 SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_SECRET")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
-
+# ================== Pydantic Models ==================
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -98,6 +99,7 @@ class DevicePayload(BaseModel):
     sensors: dict
     seizure_flag: bool = False
 
+# ================== UTILS ==================
 async def get_user_by_username(username: str):
     return await database.fetch_one(users.select().where(users.c.username == username))
 
@@ -128,7 +130,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return user
 
-
+# ================== CORS ==================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -137,6 +139,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ================== STARTUP / SHUTDOWN ==================
 @app.on_event("startup")
 async def startup():
     await database.connect()
@@ -145,10 +148,12 @@ async def startup():
 async def shutdown():
     await database.disconnect()
 
+# ================== HEALTH CHECK ==================
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok", "db": DATABASE_URL}
 
+# ================== USER ROUTES ==================
 @app.post("/api/register")
 async def register(u: UserCreate):
     if await get_user_by_username(u.username):
@@ -176,13 +181,17 @@ async def get_me(current_user=Depends(get_current_user)):
         "is_admin": current_user["is_admin"],
     }
 
+# ================== DEVICE ROUTES ==================
 @app.post("/api/devices/register")
 async def register_device(d: DeviceRegister, current_user=Depends(get_current_user)):
     my_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
     if len(my_devices) >= 4:
-        raise HTTPException(400, "Max 4 devices")
-    if await database.fetch_one(devices.select().where(devices.c.device_id == d.device_id)):
-        raise HTTPException(400, "Device already registered")
+        raise HTTPException(400, "Max 4 devices allowed per user")
+    
+    existing_device = await database.fetch_one(devices.select().where(devices.c.device_id == d.device_id))
+    if existing_device:
+        raise HTTPException(400, "Device ID already registered")
+
     await database.execute(
         devices.insert().values(user_id=current_user["id"], device_id=d.device_id, label=d.label or d.device_id)
     )
@@ -220,9 +229,7 @@ async def update_device(device_id: str, body: DeviceUpdate, current_user=Depends
     )
     if not row:
         raise HTTPException(404, "Device not found")
-    await database.execute(
-        devices.update().where(devices.c.id == row["id"]).values(label=body.label)
-    )
+    await database.execute(devices.update().where(devices.c.id == row["id"]).values(label=body.label))
     return {"status": "updated", "device_id": device_id, "label": body.label}
 
 @app.delete("/api/devices/{device_id}")
@@ -235,10 +242,7 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
     await database.execute(devices.delete().where(devices.c.id == row["id"]))
     return {"status": "deleted", "device_id": device_id}
 
-
-# =========================
-# Modified /api/devices/data for ESP32 direct access (no token required)
-# =========================
+# ================== DEVICE DATA ROUTE ==================
 @app.post("/api/devices/data")
 async def receive_device_data(payload: DevicePayload):
     device_row = await database.fetch_one(devices.select().where(devices.c.device_id == payload.device_id))
@@ -246,13 +250,13 @@ async def receive_device_data(payload: DevicePayload):
         raise HTTPException(status_code=403, detail="Device not registered")
 
     ts = datetime.utcfromtimestamp(payload.timestamp_ms / 1000.0)
-
     await database.execute(device_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts,
         payload=json.dumps(payload.dict())
     ))
 
+    # Seizure detection logic
     if payload.seizure_flag:
         user_id = device_row["user_id"]
         window_start = datetime.utcnow() - timedelta(seconds=5)
@@ -283,7 +287,7 @@ async def receive_device_data(payload: DevicePayload):
 
     return {"status": "ok"}
 
-
+# ================== DEVICE HISTORY ==================
 @app.get("/api/devices/{device_id}", response_model=List[dict])
 async def get_device_history(device_id: str, current_user=Depends(get_current_user)):
     r = await database.fetch_one(
@@ -311,6 +315,7 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
         })
     return result
 
+# ================== USERS ADMIN ==================
 @app.get("/api/users")
 async def list_users(current_user=Depends(get_current_user)):
     if not current_user["is_admin"]:
@@ -318,6 +323,7 @@ async def list_users(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(users.select())
     return [{"id": r["id"], "username": r["username"], "is_admin": r["is_admin"]} for r in rows]
 
+# ================== SEIZURE EVENTS ==================
 @app.get("/api/seizure_events")
 async def get_seizure_events(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(
@@ -346,7 +352,7 @@ async def get_all_seizure_events(current_user=Depends(get_current_user)):
     )
     return [{"timestamp": r["timestamp"].isoformat(), "device_ids": r["device_ids"].split(",")} for r in rows]
 
-
+# ================== RUN APP ==================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
