@@ -10,7 +10,7 @@ import os
 import json
 from fastapi.middleware.cors import CORSMiddleware
 
-# ================== DATABASE CONFIG ==================
+# DATABASE CONFIG
 if "DATABASE_URL" in os.environ:
     raw_url = os.environ["DATABASE_URL"]
     if raw_url.startswith("postgres://"):
@@ -31,7 +31,7 @@ engine = sqlalchemy.create_engine(
 
 app = FastAPI(title="Seizure Monitor Backend")
 
-# ================== TABLES ==================
+# TABLES
 users = sqlalchemy.Table(
     "users", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
@@ -56,6 +56,19 @@ device_data = sqlalchemy.Table(
     sqlalchemy.Column("payload", sqlalchemy.Text),
 )
 
+# NEW sensor_data table (structured columns for fast queries)
+sensor_data = sqlalchemy.Table(
+    "sensor_data", metadata,
+    sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("device_id", sqlalchemy.String, index=True),
+    sqlalchemy.Column("timestamp", sqlalchemy.DateTime, index=True),
+    sqlalchemy.Column("mag_x", sqlalchemy.Integer),
+    sqlalchemy.Column("mag_y", sqlalchemy.Integer),
+    sqlalchemy.Column("mag_z", sqlalchemy.Integer),
+    sqlalchemy.Column("battery_percent", sqlalchemy.Integer),
+    sqlalchemy.Column("seizure_flag", sqlalchemy.Boolean, default=False),
+)
+
 seizure_events = sqlalchemy.Table(
     "seizure_events", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
@@ -64,15 +77,15 @@ seizure_events = sqlalchemy.Table(
     sqlalchemy.Column("device_ids", sqlalchemy.String),
 )
 
+# create tables if not exist
 metadata.create_all(engine)
 
-# ================== AUTH CONFIG ==================
 SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_SECRET")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
-# ================== Pydantic Models ==================
+# MODELS
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -99,7 +112,17 @@ class DevicePayload(BaseModel):
     sensors: dict
     seizure_flag: bool = False
 
-# ================== UTILS ==================
+# Unified payload for ESP32 (Option C)
+class UnifiedESP32Payload(BaseModel):
+    device_id: str
+    timestamp_ms: int
+    battery_percent: int
+    seizure_flag: bool
+    mag_x: int
+    mag_y: int
+    mag_z: int
+
+# Auth helpers (unchanged)
 async def get_user_by_username(username: str):
     return await database.fetch_one(users.select().where(users.c.username == username))
 
@@ -130,7 +153,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return user
 
-# ================== CORS ==================
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -139,7 +162,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================== STARTUP / SHUTDOWN ==================
+# lifecycle
 @app.on_event("startup")
 async def startup():
     await database.connect()
@@ -148,16 +171,15 @@ async def startup():
 async def shutdown():
     await database.disconnect()
 
-# ================== HEALTH CHECK ==================
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok", "db": DATABASE_URL}
 
-# ================== USER ROUTES ==================
+# USER ROUTES
 @app.post("/api/register")
 async def register(u: UserCreate):
     if await get_user_by_username(u.username):
-        raise HTTPException(400, "Username already exists")
+        raise HTTPException(status_code=400, detail="Username already exists")
     query = users.insert().values(username=u.username, password=u.password, is_admin=u.is_admin)
     user_id = await database.execute(query)
     return {"id": user_id, "username": u.username}
@@ -166,7 +188,7 @@ async def register(u: UserCreate):
 async def login(body: LoginRequest):
     user = await authenticate_user(body.username, body.password)
     if not user:
-        raise HTTPException(401, "Invalid credentials")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_access_token(
         {"sub": user["username"], "is_admin": user["is_admin"]},
         timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
@@ -181,16 +203,16 @@ async def get_me(current_user=Depends(get_current_user)):
         "is_admin": current_user["is_admin"],
     }
 
-# ================== DEVICE ROUTES ==================
+# DEVICE ROUTES (unchanged)
 @app.post("/api/devices/register")
 async def register_device(d: DeviceRegister, current_user=Depends(get_current_user)):
     my_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
     if len(my_devices) >= 4:
-        raise HTTPException(400, "Max 4 devices allowed per user")
+        raise HTTPException(status_code=400, detail="Max 4 devices allowed per user")
     
     existing_device = await database.fetch_one(devices.select().where(devices.c.device_id == d.device_id))
     if existing_device:
-        raise HTTPException(400, "Device ID already registered")
+        raise HTTPException(status_code=400, detail="Device ID already registered")
 
     await database.execute(
         devices.insert().values(user_id=current_user["id"], device_id=d.device_id, label=d.label or d.device_id)
@@ -228,7 +250,7 @@ async def update_device(device_id: str, body: DeviceUpdate, current_user=Depends
         devices.select().where((devices.c.device_id == device_id) & (devices.c.user_id == current_user["id"]))
     )
     if not row:
-        raise HTTPException(404, "Device not found")
+        raise HTTPException(status_code=404, detail="Device not found")
     await database.execute(devices.update().where(devices.c.id == row["id"]).values(label=body.label))
     return {"status": "updated", "device_id": device_id, "label": body.label}
 
@@ -238,11 +260,11 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
         devices.select().where((devices.c.device_id == device_id) & (devices.c.user_id == current_user["id"]))
     )
     if not row:
-        raise HTTPException(404, "Device not found")
+        raise HTTPException(status_code=404, detail="Device not found")
     await database.execute(devices.delete().where(devices.c.id == row["id"]))
     return {"status": "deleted", "device_id": device_id}
 
-# ================== DEVICE DATA ROUTE ==================
+# DEVICE DATA ROUTE (for dashboard & auth clients)
 @app.post("/api/devices/data")
 async def receive_device_data(payload: DevicePayload):
     device_row = await database.fetch_one(devices.select().where(devices.c.device_id == payload.device_id))
@@ -256,7 +278,7 @@ async def receive_device_data(payload: DevicePayload):
         payload=json.dumps(payload.dict())
     ))
 
-    # Seizure detection logic
+    # seizure aggregation logic (unchanged)
     if payload.seizure_flag:
         user_id = device_row["user_id"]
         window_start = datetime.utcnow() - timedelta(seconds=5)
@@ -287,14 +309,14 @@ async def receive_device_data(payload: DevicePayload):
 
     return {"status": "ok"}
 
-# ================== DEVICE HISTORY ==================
+# DEVICE HISTORY
 @app.get("/api/devices/{device_id}", response_model=List[dict])
 async def get_device_history(device_id: str, current_user=Depends(get_current_user)):
     r = await database.fetch_one(
         devices.select().where((devices.c.device_id == device_id) & (devices.c.user_id == current_user["id"]))
     )
     if not r:
-        raise HTTPException(403, "Not your device")
+        raise HTTPException(status_code=403, detail="Not your device")
 
     rows = await database.fetch_all(
         device_data.select()
@@ -315,15 +337,15 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
         })
     return result
 
-# ================== USERS ADMIN ==================
+# USERS ADMIN
 @app.get("/api/users")
 async def list_users(current_user=Depends(get_current_user)):
     if not current_user["is_admin"]:
-        raise HTTPException(403, "Not allowed")
+        raise HTTPException(status_code=403, detail="Not allowed")
     rows = await database.fetch_all(users.select())
     return [{"id": r["id"], "username": r["username"], "is_admin": r["is_admin"]} for r in rows]
 
-# ================== SEIZURE EVENTS ==================
+# SEIZURE EVENTS endpoints (unchanged)
 @app.get("/api/seizure_events")
 async def get_seizure_events(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(
@@ -352,35 +374,89 @@ async def get_all_seizure_events(current_user=Depends(get_current_user)):
     )
     return [{"timestamp": r["timestamp"].isoformat(), "device_ids": r["device_ids"].split(",")} for r in rows]
 
+# ========== ROOT ROUTE (Fix 405 error) ==========
+@app.get("/")
+async def root():
+    return {"message": "Backend running"}
 
-class DevicePayload(BaseModel):
-    device_id: str
-    timestamp_ms: int
-    sensors: dict
-    seizure_flag: bool = False
-
-@app.post("/")
-async def root_post(payload: DevicePayload):
+# ========== Unified ESP32 upload endpoint ==========
+@app.post("/api/device/upload")
+async def upload_from_esp(payload: UnifiedESP32Payload):
     """
-    Accept device data directly at root URL for ESP32 (no auth required).
-    Only registered device_ids are allowed to store data.
+    Public endpoint for ESP32 devices (no token). Behavior:
+    - Verify device_id exists in devices table.
+    - Insert structured row into sensor_data.
+    - Also save the raw JSON into device_data (payload column) for backwards compatibility.
     """
-    # Check if device_id exists in devices table
-    device_row = await database.fetch_one(devices.select().where(devices.c.device_id == payload.device_id))
-    if not device_row:
-        raise HTTPException(status_code=403, detail="Device not registered")
 
-    # Save payload to database
+    # Step 1: Check if device exists
+    query = devices.select().where(devices.c.device_id == payload.device_id)
+    existing = await database.fetch_one(query)
+    if not existing:
+        raise HTTPException(status_code=403, detail="Unknown device_id")
+
+    # Convert timestamp
     ts = datetime.utcfromtimestamp(payload.timestamp_ms / 1000.0)
+
+    # Step 2: Insert into sensor_data
+    insert_sensor = sensor_data.insert().values(
+        device_id=payload.device_id,
+        timestamp=ts,
+        mag_x=payload.mag_x,
+        mag_y=payload.mag_y,
+        mag_z=payload.mag_z,
+        battery_percent=payload.battery_percent,
+        seizure_flag=payload.seizure_flag
+    )
+    await database.execute(insert_sensor)
+
+    # Step 3: Save into device_data (JSON payload) for compatibility
+    raw_json = {
+        "device_id": payload.device_id,
+        "timestamp_ms": payload.timestamp_ms,
+        "battery_percent": payload.battery_percent,
+        "seizure_flag": payload.seizure_flag,
+        "mag_x": payload.mag_x,
+        "mag_y": payload.mag_y,
+        "mag_z": payload.mag_z
+    }
     await database.execute(device_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts,
-        payload=json.dumps(payload.dict())
+        payload=json.dumps(raw_json)
     ))
 
-    return {"status": "ok"}
+    # Optional: trigger same seizure aggregation logic as other route (if wanted)
+    if payload.seizure_flag:
+        user_id = existing["user_id"]
+        window_start = datetime.utcnow() - timedelta(seconds=5)
+        user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == user_id))
+        ids = [d["device_id"] for d in user_devices]
+        recent_rows = await database.fetch_all(
+            device_data.select()
+            .where(device_data.c.device_id.in_(ids))
+            .where(device_data.c.timestamp >= window_start)
+        )
+        triggered = list({
+            r["device_id"]
+            for r in recent_rows
+            if json.loads(r["payload"]).get("seizure_flag")
+        })
+        if len(triggered) >= 3:
+            recent_log = await database.fetch_one(
+                seizure_events.select()
+                .where(seizure_events.c.user_id == user_id)
+                .where(seizure_events.c.timestamp >= window_start)
+            )
+            if not recent_log:
+                await database.execute(seizure_events.insert().values(
+                    user_id=user_id,
+                    timestamp=datetime.utcnow(),
+                    device_ids=",".join(triggered)
+                ))
 
-# ================== RUN APP ==================
+    return {"status": "saved"}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
