@@ -1,53 +1,42 @@
-from fastapi import FastAPI, Depends, HTTPException, Body
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta, timezone
-from jose import JWTError, jwt
-import databases
 import sqlalchemy
-from fastapi.security import OAuth2PasswordBearer
-import os
+import databases
 import json
-from fastapi.middleware.cors import CORSMiddleware
+import os
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 
 # =======================
-#   PH TIMEZONE (for conversion ONLY)
+# PH TIMEZONE
 # =======================
 PHT = timezone(timedelta(hours=8))
 
-def now_pht_naive():
-    """Return PH time as a naive datetime."""
-    return datetime.now(PHT).replace(tzinfo=None)
+def now_pht():
+    return datetime.now(PHT)
 
-def from_ms_pht_naive(ms: int):
-    """Convert timestamp_ms to naive PH datetime."""
-    return datetime.fromtimestamp(ms / 1000.0, tz=PHT).replace(tzinfo=None)
+def from_ms_to_pht(ms: int):
+    return datetime.fromtimestamp(ms / 1000.0, tz=PHT)
 
 # =======================
-#   DATABASE CONFIG
+# DATABASE CONFIG
 # =======================
-if "DATABASE_URL" in os.environ:
-    raw_url = os.environ["DATABASE_URL"]
-    if raw_url.startswith("postgres://"):
-        raw_url = raw_url.replace("postgres://", "postgresql://", 1)
-    DATABASE_URL = raw_url
-    print("➡ Using PostgreSQL:", DATABASE_URL)
-else:
-    DATABASE_URL = f"sqlite:///{os.path.abspath('seizure.db')}"
-    print("➡ Using SQLite fallback:", DATABASE_URL)
+DATABASE_URL = os.environ.get("DATABASE_URL", f"sqlite:///{os.path.abspath('seizure.db')}")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
-
 engine = sqlalchemy.create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+    DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 )
 
-app = FastAPI(title="Seizure Monitor Backend")
-
 # =======================
-#   TABLE DEFINITIONS
+# TABLES
 # =======================
 users = sqlalchemy.Table(
     "users", metadata,
@@ -63,22 +52,14 @@ devices = sqlalchemy.Table(
     sqlalchemy.Column("user_id", sqlalchemy.Integer, sqlalchemy.ForeignKey("users.id")),
     sqlalchemy.Column("device_id", sqlalchemy.String, unique=True),
     sqlalchemy.Column("label", sqlalchemy.String),
-    sqlalchemy.Column("last_seen", sqlalchemy.DateTime, nullable=True),  # naive PH time
-)
-
-device_data = sqlalchemy.Table(
-    "device_data", metadata,
-    sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
-    sqlalchemy.Column("device_id", sqlalchemy.String),
-    sqlalchemy.Column("timestamp", sqlalchemy.DateTime),   # naive PH time
-    sqlalchemy.Column("payload", sqlalchemy.Text),
+    sqlalchemy.Column("last_seen", sqlalchemy.DateTime, nullable=True),  # PH timezone aware
 )
 
 sensor_data = sqlalchemy.Table(
     "sensor_data", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("device_id", sqlalchemy.String, index=True),
-    sqlalchemy.Column("timestamp", sqlalchemy.DateTime, index=True),  # naive PH time
+    sqlalchemy.Column("timestamp", sqlalchemy.DateTime, index=True),  # PH timezone aware
     sqlalchemy.Column("mag_x", sqlalchemy.Integer),
     sqlalchemy.Column("mag_y", sqlalchemy.Integer),
     sqlalchemy.Column("mag_z", sqlalchemy.Integer),
@@ -90,20 +71,79 @@ seizure_events = sqlalchemy.Table(
     "seizure_events", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("user_id", sqlalchemy.Integer, sqlalchemy.ForeignKey("users.id")),
-    sqlalchemy.Column("timestamp", sqlalchemy.DateTime),  # naive PH time
+    sqlalchemy.Column("timestamp", sqlalchemy.DateTime),
     sqlalchemy.Column("device_ids", sqlalchemy.String),
 )
 
 metadata.create_all(engine)
 
 # =======================
-#   AUTH
+# AUTH
 # =======================
 SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_SECRET")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def verify_password(plain_password, hashed):
+    return pwd_context.verify(plain_password, hashed)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = now_pht() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_user_by_username(username: str):
+    return await database.fetch_one(users.select().where(users.c.username == username))
+
+async def authenticate_user(username: str, password: str):
+    user = await get_user_by_username(username)
+    if not user or not verify_password(password, user["password"]):
+        return None
+    return user
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    exc = HTTPException(status_code=401, detail="Invalid or expired token")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if username is None:
+            raise exc
+    except JWTError:
+        raise exc
+    user = await get_user_by_username(username)
+    if not user:
+        raise exc
+    return user
+
+# =======================
+# APP INIT
+# =======================
+app = FastAPI(title="Seizure Monitor Backend")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def startup():
+    await database.connect()
+
+@app.on_event("shutdown")
+async def shutdown():
+    await database.disconnect()
+
+# =======================
+# MODELS
+# =======================
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -124,12 +164,6 @@ class DeviceRegister(BaseModel):
 class DeviceUpdate(BaseModel):
     label: str
 
-class DevicePayload(BaseModel):
-    device_id: str
-    timestamp_ms: int
-    sensors: dict
-    seizure_flag: bool = False
-
 class UnifiedESP32Payload(BaseModel):
     device_id: str
     timestamp_ms: int
@@ -139,96 +173,35 @@ class UnifiedESP32Payload(BaseModel):
     mag_y: int
     mag_z: int
 
-async def get_user_by_username(username: str):
-    return await database.fetch_one(users.select().where(users.c.username == username))
+# =======================
+# HELPERS
+# =======================
+async def log_device_connection(device_id: str, ts: datetime):
+    await database.execute(
+        devices.update().where(devices.c.device_id == device_id).values(last_seen=ts)
+    )
 
-async def authenticate_user(username: str, password: str):
-    user = await get_user_by_username(username)
-    if not user or user["password"] != password:
+def is_connected(last_seen: datetime, timeout: int = 60):
+    if not last_seen:
         return False
-    return user
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    expire = now_pht_naive() + (expires_delta or timedelta(minutes=15))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    exc = HTTPException(status_code=401, detail="Invalid or expired token")
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if username is None:
-            raise exc
-    except JWTError:
-        raise exc
-
-    user = await get_user_by_username(username)
-    if not user:
-        raise exc
-    return user
+    return (now_pht() - last_seen).total_seconds() <= timeout
 
 # =======================
-#   CORS
+# ROUTES
 # =======================
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# =======================
-#   LIFECYCLE
-# =======================
-@app.on_event("startup")
-async def startup():
-    await database.connect()
-
-@app.on_event("shutdown")
-async def shutdown():
-    await database.disconnect()
-
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok", "db": DATABASE_URL}
 
-# =======================
-#   HELPER: log + update last_seen (naive PH time)
-# =======================
-async def log_device_connection(device_id: str):
-    row = await database.fetch_one(devices.select().where(devices.c.device_id == device_id))
-    if not row:
-        print(f"[DEVICE CONNECT] Unknown device {device_id}")
-        return
-
-    user_row = await database.fetch_one(users.select().where(users.c.id == row["user_id"]))
-    username = user_row["username"] if user_row else "<unknown>"
-
-    now = now_pht_naive()
-
-    try:
-        await database.execute(
-            devices.update()
-            .where(devices.c.device_id == device_id)
-            .values(last_seen=now)
-        )
-    except Exception as e:
-        print(f"[DEVICE CONNECT] Could not update last_seen for {device_id}: {e}")
-
-    print(f"[DEVICE CONNECTED] Device {device_id} belongs to user {username} (last_seen={now})")
-
-# =======================
-#   USER ROUTES
-# =======================
 @app.post("/api/register")
 async def register(u: UserCreate):
     if await get_user_by_username(u.username):
         raise HTTPException(status_code=400, detail="Username exists")
-    query = users.insert().values(username=u.username, password=u.password, is_admin=u.is_admin)
-    user_id = await database.execute(query)
+    user_id = await database.execute(users.insert().values(
+        username=u.username,
+        password=hash_password(u.password),
+        is_admin=u.is_admin
+    ))
     return {"id": user_id, "username": u.username}
 
 @app.post("/api/login", response_model=Token)
@@ -238,138 +211,73 @@ async def login(body: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid login")
     token = create_access_token(
         {"sub": user["username"], "is_admin": user["is_admin"]},
-        timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
     return {"access_token": token, "token_type": "bearer"}
 
-@app.get("/api/me")
-async def get_me(current_user=Depends(get_current_user)):
-    return {
-        "id": current_user["id"],
-        "username": current_user["username"],
-        "is_admin": current_user["is_admin"],
-    }
-
-# =======================
-#   DEVICE ROUTES
-# =======================
+# -----------------------
+# DEVICE MANAGEMENT
+# -----------------------
 @app.post("/api/devices/register")
 async def register_device(d: DeviceRegister, current_user=Depends(get_current_user)):
-    my_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
-    if len(my_devices) >= 4:
-        raise HTTPException(status_code=400, detail="Max 4 devices allowed")
     if await database.fetch_one(devices.select().where(devices.c.device_id == d.device_id)):
         raise HTTPException(status_code=400, detail="Device ID exists")
-
-    await database.execute(
-        devices.insert().values(user_id=current_user["id"], device_id=d.device_id, label=d.label or d.device_id)
-    )
+    await database.execute(devices.insert().values(
+        user_id=current_user["id"],
+        device_id=d.device_id,
+        label=d.label or d.device_id
+    ))
     return {"status": "ok", "device_id": d.device_id}
-
-@app.get("/api/mydevices")
-async def get_my_devices(current_user=Depends(get_current_user)):
-    rows = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
-    output = []
-
-    now = now_pht_naive()
-
-    for r in rows:
-        latest_data = await database.fetch_one(
-            device_data.select()
-            .where(device_data.c.device_id == r["device_id"])
-            .order_by(device_data.c.timestamp.desc())
-            .limit(1)
-        )
-
-        battery = 100
-        last_sync_val = None
-
-        if latest_data:
-            payload = json.loads(latest_data["payload"])
-            battery = payload.get("battery_percent", 100)
-
-            ts = latest_data["timestamp"]
-            diff = (now - ts).total_seconds()
-
-            last_sync_val = "Just now" if diff <= 10 else ts.isoformat()
-
-        output.append({
-            "device_id": r["device_id"],
-            "label": r["label"],
-            "battery_percent": battery,
-            "last_sync": last_sync_val,
-            "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,
-        })
-
-    return output
 
 @app.put("/api/devices/{device_id}")
 async def update_device(device_id: str, body: DeviceUpdate, current_user=Depends(get_current_user)):
-    row = await database.fetch_one(
-        devices.select().where(
-            (devices.c.device_id == device_id) &
-            (devices.c.user_id == current_user["id"])
-        )
-    )
+    row = await database.fetch_one(devices.select().where(
+        (devices.c.device_id == device_id) & (devices.c.user_id == current_user["id"])
+    ))
     if not row:
         raise HTTPException(status_code=404, detail="Device not found")
-
     await database.execute(devices.update().where(devices.c.id == row["id"]).values(label=body.label))
-    return {"status": "updated", "device_id": device_id, "label": body.label}
+    return {"status": "updated"}
 
-@app.delete("/api/devices/{device_id}")
-async def delete_device(device_id: str, current_user=Depends(get_current_user)):
-    row = await database.fetch_one(
-        devices.select().where(
-            (devices.c.device_id == device_id) &
-            (devices.c.user_id == current_user["id"])
-        )
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Device not found")
+# -----------------------
+# DEVICE DATA UPLOAD
+# -----------------------
+@app.post("/api/device/upload")
+async def upload_from_esp(payload: UnifiedESP32Payload):
+    device = await database.fetch_one(devices.select().where(devices.c.device_id == payload.device_id))
+    if not device:
+        raise HTTPException(status_code=403, detail="Unknown device")
 
-    await database.execute(devices.delete().where(devices.c.id == row["id"]))
-    return {"status": "deleted", "device_id": device_id}
+    ts = from_ms_to_pht(payload.timestamp_ms)
 
-# =======================
-#   RECEIVE DEVICE DATA
-# =======================
-@app.post("/api/devices/data")
-async def receive_device_data(payload: DevicePayload):
-
-    device_row = await database.fetch_one(devices.select().where(devices.c.device_id == payload.device_id))
-    if not device_row:
-        raise HTTPException(status_code=403, detail="Device not registered")
-
-    ts = from_ms_pht_naive(payload.timestamp_ms)
-
-    await database.execute(device_data.insert().values(
+    # Save sensor data
+    await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts,
-        payload=json.dumps(payload.dict())
+        mag_x=payload.mag_x,
+        mag_y=payload.mag_y,
+        mag_z=payload.mag_z,
+        battery_percent=payload.battery_percent,
+        seizure_flag=payload.seizure_flag
     ))
 
-    await log_device_connection(payload.device_id)
+    # Update last_seen based on ESP32 timestamp
+    await log_device_connection(payload.device_id, ts)
 
-    # Seizure detection
+    # Seizure detection (window=5s, trigger if 3 devices report seizure)
     if payload.seizure_flag:
-        user_id = device_row["user_id"]
+        user_id = device["user_id"]
         window_start = ts - timedelta(seconds=5)
-
         user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == user_id))
         ids = [d["device_id"] for d in user_devices]
 
         recent_rows = await database.fetch_all(
-            device_data.select()
-            .where(device_data.c.device_id.in_(ids))
-            .where(device_data.c.timestamp >= window_start)
+            sensor_data.select()
+            .where(sensor_data.c.device_id.in_(ids))
+            .where(sensor_data.c.timestamp >= window_start)
         )
 
-        triggered = list({
-            r["device_id"]
-            for r in recent_rows
-            if json.loads(r["payload"]).get("seizure_flag")
-        })
+        triggered = list({r["device_id"] for r in recent_rows if r["seizure_flag"]})
 
         if len(triggered) >= 3:
             existing_event = await database.fetch_one(
@@ -384,173 +292,16 @@ async def receive_device_data(payload: DevicePayload):
                     device_ids=",".join(triggered)
                 ))
 
-    return {"status": "ok"}
-
-# =======================
-#   DEVICE HISTORY
-# =======================
-@app.get("/api/devices/{device_id}", response_model=List[dict])
-async def get_device_history(device_id: str, current_user=Depends(get_current_user)):
-
-    r = await database.fetch_one(
-        devices.select().where(
-            (devices.c.device_id == device_id) &
-            (devices.c.user_id == current_user["id"])
-        )
-    )
-    if not r:
-        raise HTTPException(status_code=403, detail="Not your device")
-
-    rows = await database.fetch_all(
-        device_data.select()
-        .where(device_data.c.device_id == device_id)
-        .order_by(device_data.c.timestamp.desc())
-        .limit(1000)
-    )
-
-    result = []
-    for row in rows:
-        payload = json.loads(row["payload"])
-        ts = row["timestamp"]
-
-        result.append({
-            "id": row["id"],
-            "device_id": row["device_id"],
-            "timestamp": ts.isoformat(),
-            "payload": payload,
-            "battery_percent": payload.get("battery_percent", 100),
-        })
-
-    return result
-
-# =======================
-#   SEIZURE EVENTS
-# =======================
-@app.get("/api/seizure_events")
-async def get_seizure_events(current_user=Depends(get_current_user)):
-    rows = await database.fetch_all(
-        seizure_events.select()
-        .where(seizure_events.c.user_id == current_user["id"])
-        .order_by(seizure_events.c.timestamp.desc())
-    )
-    return [{
-        "timestamp": r["timestamp"].isoformat(),
-        "device_ids": r["device_ids"].split(",")
-    } for r in rows]
-
-@app.get("/api/seizure_events/latest")
-async def get_latest_event(current_user=Depends(get_current_user)):
-    row = await database.fetch_one(
-        seizure_events.select()
-        .where(seizure_events.c.user_id == current_user["id"])
-        .order_by(seizure_events.c.timestamp.desc())
-        .limit(1)
-    )
-    if not row:
-        return {}
-    return {
-        "timestamp": row["timestamp"].isoformat(),
-        "device_ids": row["device_ids"].split(",")
-    }
-
-@app.get("/api/seizure_events/all")
-async def get_all_seizure_events(current_user=Depends(get_current_user)):
-    rows = await database.fetch_all(
-        seizure_events.select().order_by(seizure_events.c.timestamp.desc())
-    )
-    return [{
-        "timestamp": r["timestamp"].isoformat(),
-        "device_ids": r["device_ids"].split(",")
-    } for r in rows]
-
-# =======================
-#   ESP32 UPLOAD
-# =======================
-@app.post("/api/device/upload")
-async def upload_from_esp(payload: UnifiedESP32Payload):
-
-    existing = await database.fetch_one(
-        devices.select().where(devices.c.device_id == payload.device_id)
-    )
-    if not existing:
-        raise HTTPException(status_code=403, detail="Unknown device_id")
-
-    ts = from_ms_pht_naive(payload.timestamp_ms)
-
-    await database.execute(sensor_data.insert().values(
-        device_id=payload.device_id,
-        timestamp=ts,
-        mag_x=payload.mag_x,
-        mag_y=payload.mag_y,
-        mag_z=payload.mag_z,
-        battery_percent=payload.battery_percent,
-        seizure_flag=payload.seizure_flag
-    ))
-
-    raw_json = {
-        "device_id": payload.device_id,
-        "timestamp_ms": payload.timestamp_ms,
-        "battery_percent": payload.battery_percent,
-        "seizure_flag": payload.seizure_flag,
-        "mag_x": payload.mag_x,
-        "mag_y": payload.mag_y,
-        "mag_z": payload.mag_z
-    }
-
-    await database.execute(device_data.insert().values(
-        device_id=payload.device_id,
-        timestamp=ts,
-        payload=json.dumps(raw_json)
-    ))
-
-    await log_device_connection(payload.device_id)
-
-    if payload.seizure_flag:
-        user_id = existing["user_id"]
-        window_start = ts - timedelta(seconds=5)
-
-        user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == user_id))
-        ids = [d["device_id"] for d in user_devices]
-
-        recent_rows = await database.fetch_all(
-            device_data.select()
-            .where(device_data.c.device_id.in_(ids))
-            .where(device_data.c.timestamp >= window_start)
-        )
-
-        triggered = list({
-            r["device_id"]
-            for r in recent_rows
-            if json.loads(r["payload"]).get("seizure_flag")
-        })
-
-        if len(triggered) >= 3:
-            recent_log = await database.fetch_one(
-                seizure_events.select()
-                .where(seizure_events.c.user_id == user_id)
-                .where(seizure_events.c.timestamp >= window_start)
-            )
-            if not recent_log:
-                await database.execute(seizure_events.insert().values(
-                    user_id=user_id,
-                    timestamp=ts,
-                    device_ids=",".join(triggered)
-                ))
-
     return {"status": "saved"}
 
-# =======================
-#   DEVICES + LATEST SENSOR DATA
-# =======================
+# -----------------------
+# DEVICES + LATEST DATA
+# -----------------------
 @app.get("/api/mydevices_with_latest_data")
-async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
-    user_devices = await database.fetch_all(
-        devices.select().where(devices.c.user_id == current_user["id"])
-    )
+async def my_devices_with_latest(current_user=Depends(get_current_user)):
+    user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
     output = []
-
-    now = datetime.now(PHT)  # aware datetime in PHT
-
+    now = now_pht()
     for d in user_devices:
         latest = await database.fetch_one(
             sensor_data.select()
@@ -558,52 +309,33 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
             .order_by(sensor_data.c.timestamp.desc())
             .limit(1)
         )
-
-        # Handle latest sensor data
-        if latest:
-            ts = latest["timestamp"]
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=PHT)  # make aware if naive
-            diff = (now - ts).total_seconds()
-            last_sync_val = "Just now" if diff <= 10 else ts.isoformat()
-        else:
-            ts = None
-            last_sync_val = None
-
-        # Handle last_seen from device
-        last_seen_val = None
-        connected = False
-        if d["last_seen"]:
-            last_seen_val = d["last_seen"]
-            if last_seen_val.tzinfo is None:
-                last_seen_val = last_seen_val.replace(tzinfo=PHT)
-            diff_seen = (now - last_seen_val).total_seconds()
-            connected = diff_seen <= 60
-
+        last_sync = latest["timestamp"].isoformat() if latest else None
+        battery = latest["battery_percent"] if latest else 100
+        seizure_flag = latest["seizure_flag"] if latest else False
+        connected = is_connected(d["last_seen"])
         output.append({
             "device_id": d["device_id"],
             "label": d["label"],
-            "battery_percent": latest["battery_percent"] if latest else 100,
-            "last_sync": last_sync_val,
-            "last_seen": last_seen_val.isoformat() if last_seen_val else None,
+            "battery_percent": battery,
+            "last_sync": last_sync,
+            "last_seen": d["last_seen"].isoformat() if d["last_seen"] else None,
             "mag_x": latest["mag_x"] if latest else 0,
             "mag_y": latest["mag_y"] if latest else 0,
             "mag_z": latest["mag_z"] if latest else 0,
-            "seizure_flag": latest["seizure_flag"] if latest else False,
+            "seizure_flag": seizure_flag,
             "connected": connected
         })
-
     return output
 
-# =======================
-#   ROOT
-# =======================
+# -----------------------
+# ROOT
+# -----------------------
 @app.get("/")
 async def root():
     return {"message": "Backend running"}
 
 # =======================
-#   RUN
+# RUN
 # =======================
 if __name__ == "__main__":
     import uvicorn
