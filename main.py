@@ -475,6 +475,7 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
 async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
     user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
     output = []
+    now = datetime.now(PHT)
     for d in user_devices:
         latest = await database.fetch_one(
             sensor_data.select()
@@ -483,14 +484,14 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
             .limit(1)
         )
         if latest:
-            ts = to_pht(latest["timestamp"])
-            now = datetime.now(PHT)
-            diff = (now - ts).total_seconds()
-            last_sync_val = "Just now" if diff <= 10 else ts.isoformat()
+            ts_ph = to_pht(latest["timestamp"])
+            diff = (now - ts_ph).total_seconds()
+            last_sync_val = "Just now" if diff <= 10 else ts_ph.strftime("%H:%M")
             connected = diff <= 5
         else:
             last_sync_val = None
             connected = False
+
         output.append({
             "device_id": d["device_id"],
             "label": d["label"],
@@ -503,6 +504,7 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
             "connected": connected
         })
     return output
+
 
 # =======================
 #   ROOT
