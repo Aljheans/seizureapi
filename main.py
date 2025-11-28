@@ -158,7 +158,7 @@ class DeviceUpdate(BaseModel):
 
 class UnifiedESP32Payload(BaseModel):
     device_id: str
-    timestamp_ms: int
+    timestamp_ms: int 
     battery_percent: int
     seizure_flag: bool
     mag_x: int
@@ -207,9 +207,7 @@ async def login(body: LoginRequest):
     )
     return {"access_token": token, "token_type": "bearer"}
 
-# -----------------------
 # DEVICE MANAGEMENT
-# -----------------------
 @app.post("/api/devices/register")
 async def register_device(d: DeviceRegister, current_user=Depends(get_current_user)):
     if await database.fetch_one(devices.select().where(devices.c.device_id == d.device_id)):
@@ -236,16 +234,18 @@ async def update_device(device_id: str, body: DeviceUpdate, current_user=Depends
 # -----------------------
 @app.post("/api/device/upload")
 async def upload_from_esp(payload: UnifiedESP32Payload):
+    # Check if device exists
     device = await database.fetch_one(devices.select().where(devices.c.device_id == payload.device_id))
     if not device:
         raise HTTPException(status_code=403, detail="Unknown device")
 
-    ts = from_ms_to_pht(payload.timestamp_ms)
+    # Convert milliseconds to Python datetime (raw timestamp)
+    ts = datetime.fromtimestamp(payload.timestamp_ms / 1000.0)
 
-    # Save sensor data
+    # Save raw sensor data
     await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
-        timestamp=ts,
+        timestamp=ts,  # store raw timestamp
         mag_x=payload.mag_x,
         mag_y=payload.mag_y,
         mag_z=payload.mag_z,
@@ -253,10 +253,10 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         seizure_flag=payload.seizure_flag
     ))
 
-    # Update last_seen based on ESP32 timestamp
+    # Update last_seen using raw timestamp
     await log_device_connection(payload.device_id, ts)
 
-    # Seizure detection (window=5s, trigger if 3 devices report seizure)
+    # Seizure detection (optional, same as before)
     if payload.seizure_flag:
         user_id = device["user_id"]
         window_start = ts - timedelta(seconds=5)
