@@ -11,9 +11,17 @@ import json
 from fastapi.middleware.cors import CORSMiddleware
 
 # =======================
-#   PH TIMEZONE
+#   PH TIMEZONE (for conversion ONLY)
 # =======================
 PHT = timezone(timedelta(hours=8))
+
+def now_pht_naive():
+    """Return PH time as a naive datetime."""
+    return datetime.now(PHT).replace(tzinfo=None)
+
+def from_ms_pht_naive(ms: int):
+    """Convert timestamp_ms to naive PH datetime."""
+    return datetime.fromtimestamp(ms / 1000.0, tz=PHT).replace(tzinfo=None)
 
 # =======================
 #   DATABASE CONFIG
@@ -49,21 +57,20 @@ users = sqlalchemy.Table(
     sqlalchemy.Column("is_admin", sqlalchemy.Boolean, default=False),
 )
 
-# NOTE: added last_seen column (timezone-aware) — for Postgres you must run a migration to add it
 devices = sqlalchemy.Table(
     "devices", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("user_id", sqlalchemy.Integer, sqlalchemy.ForeignKey("users.id")),
     sqlalchemy.Column("device_id", sqlalchemy.String, unique=True),
     sqlalchemy.Column("label", sqlalchemy.String),
-    sqlalchemy.Column("last_seen", sqlalchemy.DateTime(timezone=True), nullable=True),  # NEW
+    sqlalchemy.Column("last_seen", sqlalchemy.DateTime, nullable=True),  # naive PH time
 )
 
 device_data = sqlalchemy.Table(
     "device_data", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("device_id", sqlalchemy.String),
-    sqlalchemy.Column("timestamp", sqlalchemy.DateTime),
+    sqlalchemy.Column("timestamp", sqlalchemy.DateTime),   # naive PH time
     sqlalchemy.Column("payload", sqlalchemy.Text),
 )
 
@@ -71,7 +78,7 @@ sensor_data = sqlalchemy.Table(
     "sensor_data", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("device_id", sqlalchemy.String, index=True),
-    sqlalchemy.Column("timestamp", sqlalchemy.DateTime, index=True),
+    sqlalchemy.Column("timestamp", sqlalchemy.DateTime, index=True),  # naive PH time
     sqlalchemy.Column("mag_x", sqlalchemy.Integer),
     sqlalchemy.Column("mag_y", sqlalchemy.Integer),
     sqlalchemy.Column("mag_z", sqlalchemy.Integer),
@@ -83,11 +90,10 @@ seizure_events = sqlalchemy.Table(
     "seizure_events", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("user_id", sqlalchemy.Integer, sqlalchemy.ForeignKey("users.id")),
-    sqlalchemy.Column("timestamp", sqlalchemy.DateTime),
+    sqlalchemy.Column("timestamp", sqlalchemy.DateTime),  # naive PH time
     sqlalchemy.Column("device_ids", sqlalchemy.String),
 )
 
-# Will create missing tables only. It will NOT ALTER existing tables to add columns.
 metadata.create_all(engine)
 
 # =======================
@@ -144,7 +150,7 @@ async def authenticate_user(username: str, password: str):
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
-    expire = datetime.now(PHT) + (expires_delta or timedelta(minutes=15))
+    expire = now_pht_naive() + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -190,35 +196,29 @@ async def health_check():
     return {"status": "ok", "db": DATABASE_URL}
 
 # =======================
-#   HELPER: log + update last_seen
+#   HELPER: log + update last_seen (naive PH time)
 # =======================
 async def log_device_connection(device_id: str):
-    """Update devices.last_seen and print a server-side log including the owning username.
-
-    NOTE: For Postgres deployments you must add the `last_seen` column via migration
-    (ALTER TABLE ...) before relying on this field to exist in the DB.
-    """
     row = await database.fetch_one(devices.select().where(devices.c.device_id == device_id))
     if not row:
-        # Unknown device; nothing to log
         print(f"[DEVICE CONNECT] Unknown device {device_id}")
         return
 
     user_row = await database.fetch_one(users.select().where(users.c.id == row["user_id"]))
     username = user_row["username"] if user_row else "<unknown>"
 
-    now = datetime.now(PHT)
-    # Update last_seen (timezone-aware)
+    now = now_pht_naive()
+
     try:
         await database.execute(
-            devices.update().where(devices.c.device_id == device_id).values(last_seen=now)
+            devices.update()
+            .where(devices.c.device_id == device_id)
+            .values(last_seen=now)
         )
     except Exception as e:
-        # If the column doesn't exist on the live DB, we don't want to crash the request.
-        # Print a helpful message for operators and continue.
         print(f"[DEVICE CONNECT] Could not update last_seen for {device_id}: {e}")
 
-    print(f"[DEVICE CONNECTED] Device {device_id} belongs to user {username} (last_seen={now.isoformat()})")
+    print(f"[DEVICE CONNECTED] Device {device_id} belongs to user {username} (last_seen={now})")
 
 # =======================
 #   USER ROUTES
@@ -271,6 +271,8 @@ async def get_my_devices(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
     output = []
 
+    now = now_pht_naive()
+
     for r in rows:
         latest_data = await database.fetch_one(
             device_data.select()
@@ -286,8 +288,7 @@ async def get_my_devices(current_user=Depends(get_current_user)):
             payload = json.loads(latest_data["payload"])
             battery = payload.get("battery_percent", 100)
 
-            ts = latest_data["timestamp"].astimezone(PHT)
-            now = datetime.now(PHT)
+            ts = latest_data["timestamp"]
             diff = (now - ts).total_seconds()
 
             last_sync_val = "Just now" if diff <= 10 else ts.isoformat()
@@ -297,7 +298,7 @@ async def get_my_devices(current_user=Depends(get_current_user)):
             "label": r["label"],
             "battery_percent": battery,
             "last_sync": last_sync_val,
-            "last_seen": r["last_seen"].astimezone(PHT).isoformat() if r.get("last_seen") else None,
+            "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,
         })
 
     return output
@@ -340,8 +341,7 @@ async def receive_device_data(payload: DevicePayload):
     if not device_row:
         raise HTTPException(status_code=403, detail="Device not registered")
 
-    # Use timestamp from the device exactly as sent
-    ts = datetime.fromtimestamp(payload.timestamp_ms / 1000.0, tz=PHT)
+    ts = from_ms_pht_naive(payload.timestamp_ms)
 
     await database.execute(device_data.insert().values(
         device_id=payload.device_id,
@@ -349,13 +349,12 @@ async def receive_device_data(payload: DevicePayload):
         payload=json.dumps(payload.dict())
     ))
 
-    # Update last_seen and log connection
     await log_device_connection(payload.device_id)
 
-    # Seizure detection using device timestamps, not server time
+    # Seizure detection
     if payload.seizure_flag:
         user_id = device_row["user_id"]
-        window_start = ts - timedelta(seconds=5)  # 5-second window based on device timestamp
+        window_start = ts - timedelta(seconds=5)
 
         user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == user_id))
         ids = [d["device_id"] for d in user_devices]
@@ -381,7 +380,7 @@ async def receive_device_data(payload: DevicePayload):
             if not existing_event:
                 await database.execute(seizure_events.insert().values(
                     user_id=user_id,
-                    timestamp=ts,  # Use device timestamp for seizure event
+                    timestamp=ts,
                     device_ids=",".join(triggered)
                 ))
 
@@ -412,7 +411,7 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
     result = []
     for row in rows:
         payload = json.loads(row["payload"])
-        ts = row["timestamp"].astimezone(PHT)
+        ts = row["timestamp"]
 
         result.append({
             "id": row["id"],
@@ -435,7 +434,7 @@ async def get_seizure_events(current_user=Depends(get_current_user)):
         .order_by(seizure_events.c.timestamp.desc())
     )
     return [{
-        "timestamp": r["timestamp"].astimezone(PHT).isoformat(),
+        "timestamp": r["timestamp"].isoformat(),
         "device_ids": r["device_ids"].split(",")
     } for r in rows]
 
@@ -450,7 +449,7 @@ async def get_latest_event(current_user=Depends(get_current_user)):
     if not row:
         return {}
     return {
-        "timestamp": row["timestamp"].astimezone(PHT).isoformat(),
+        "timestamp": row["timestamp"].isoformat(),
         "device_ids": row["device_ids"].split(",")
     }
 
@@ -460,10 +459,9 @@ async def get_all_seizure_events(current_user=Depends(get_current_user)):
         seizure_events.select().order_by(seizure_events.c.timestamp.desc())
     )
     return [{
-        "timestamp": r["timestamp"].astimezone(PHT).isoformat(),
+        "timestamp": r["timestamp"].isoformat(),
         "device_ids": r["device_ids"].split(",")
     } for r in rows]
-
 
 # =======================
 #   ESP32 UPLOAD
@@ -477,10 +475,8 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
     if not existing:
         raise HTTPException(status_code=403, detail="Unknown device_id")
 
-    # Convert device timestamp to timezone-aware datetime
-    ts = datetime.fromtimestamp(payload.timestamp_ms / 1000.0, tz=PHT)
+    ts = from_ms_pht_naive(payload.timestamp_ms)
 
-    # Insert into sensor_data
     await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts,
@@ -491,7 +487,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         seizure_flag=payload.seizure_flag
     ))
 
-    # Insert raw payload for history
     raw_json = {
         "device_id": payload.device_id,
         "timestamp_ms": payload.timestamp_ms,
@@ -508,13 +503,11 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         payload=json.dumps(raw_json)
     ))
 
-    # Update last_seen and log connection
     await log_device_connection(payload.device_id)
 
-    # Seizure aggregation using device timestamp
     if payload.seizure_flag:
         user_id = existing["user_id"]
-        window_start = ts - timedelta(seconds=5)  # 5-second window
+        window_start = ts - timedelta(seconds=5)
 
         user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == user_id))
         ids = [d["device_id"] for d in user_devices]
@@ -540,7 +533,7 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
             if not recent_log:
                 await database.execute(seizure_events.insert().values(
                     user_id=user_id,
-                    timestamp=ts,  # device timestamp
+                    timestamp=ts,
                     device_ids=",".join(triggered)
                 ))
 
@@ -554,6 +547,8 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
     user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
     output = []
 
+    now = now_pht_naive()
+
     for d in user_devices:
         latest = await database.fetch_one(
             sensor_data.select()
@@ -563,23 +558,19 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
         )
 
         if latest:
-            ts = latest["timestamp"].astimezone(PHT)
-            now = datetime.now(PHT)
+            ts = latest["timestamp"]
             diff = (now - ts).total_seconds()
-
             last_sync_val = "Just now" if diff <= 10 else ts.isoformat()
-
             connected = False
         else:
             last_sync_val = None
             connected = False
             ts = None
 
-        # Evaluate connection using devices.last_seen when available (preferred)
         last_seen_val = None
-        if d.get("last_seen"):
-            last_seen_val = d["last_seen"].astimezone(PHT)
-            diff_seen = (datetime.now(PHT) - last_seen_val).total_seconds()
+        if d["last_seen"]:
+            last_seen_val = d["last_seen"]
+            diff_seen = (now - last_seen_val).total_seconds()
             connected = diff_seen <= 60
 
         output.append({
