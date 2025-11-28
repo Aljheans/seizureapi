@@ -369,7 +369,10 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         raise HTTPException(status_code=403, detail="Unknown device_id")
 
     # Convert milliseconds to UTC datetime
-    ts_utc = datetime.utcfromtimestamp(payload.timestamp_ms / 1000.0).replace(tzinfo=timezone.utc)
+    ts_val = payload.timestamp_ms
+    if ts_val > 1e10:  # Treat as milliseconds
+        ts_val = ts_val / 1000.0
+    ts_utc = datetime.utcfromtimestamp(ts_val).replace(tzinfo=timezone.utc)
 
     # Insert sensor data
     await database.execute(sensor_data.insert().values(
