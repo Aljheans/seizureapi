@@ -9,7 +9,8 @@ import databases
 import json
 import os
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+
+# NOTE: Removed 'from passlib.context import CryptContext' as requested.
 
 # =======================
 # PH TIMEZONE
@@ -84,13 +85,8 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_SECRET")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def hash_password(password: str):
-    return pwd_context.hash(password)
-
-def verify_password(plain_password, hashed):
-    return pwd_context.verify(plain_password, hashed)
+# Removed hash_password and verify_password functions.
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -103,7 +99,8 @@ async def get_user_by_username(username: str):
 
 async def authenticate_user(username: str, password: str):
     user = await get_user_by_username(username)
-    if not user or not verify_password(password, user["password"]):
+    # Changed: Direct comparison of raw password with stored password
+    if not user or password != user["password"]:
         return None
     return user
 
@@ -197,9 +194,10 @@ async def health_check():
 async def register(u: UserCreate):
     if await get_user_by_username(u.username):
         raise HTTPException(status_code=400, detail="Username exists")
+    # Changed: Saving raw password directly
     user_id = await database.execute(users.insert().values(
         username=u.username,
-        password=hash_password(u.password),
+        password=u.password,
         is_admin=u.is_admin
     ))
     return {"id": user_id, "username": u.username}
