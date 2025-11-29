@@ -11,9 +11,6 @@ import json
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 
-# =======================
-#   PH TIMEZONE
-# =======================
 PHT = timezone(timedelta(hours=8))
 
 def to_pht(dt_utc: datetime) -> datetime:
@@ -21,9 +18,6 @@ def to_pht(dt_utc: datetime) -> datetime:
         dt_utc = dt_utc.replace(tzinfo=timezone.utc)
     return dt_utc.astimezone(PHT)
 
-# =======================
-#   DATABASE CONFIG
-# =======================
 if "DATABASE_URL" in os.environ:
     raw_url = os.environ["DATABASE_URL"]
     if raw_url.startswith("postgres://"):
@@ -41,9 +35,6 @@ engine = sqlalchemy.create_engine(
 
 app = FastAPI(title="Seizure Monitor Backend")
 
-# =======================
-#   TABLE DEFINITIONS
-# =======================
 users = sqlalchemy.Table(
     "users", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
@@ -90,9 +81,6 @@ seizure_events = sqlalchemy.Table(
 
 metadata.create_all(engine)
 
-# =======================
-#   AUTH
-# =======================
 SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_SECRET")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
@@ -127,9 +115,7 @@ class UnifiedESP32Payload(BaseModel):
     mag_y: int
     mag_z: int
 
-# =======================
-#   HELPER FUNCTIONS
-# =======================
+#HELPER FUNCTIONS
 async def get_user_by_username(username: str):
     return await database.fetch_one(users.select().where(users.c.username == username))
 
@@ -159,9 +145,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise exc
     return user
 
-# =======================
-#   CORS
-# =======================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -170,10 +153,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =======================
-#   DEVICE CONNECTION LOGGING
-# =======================
-device_states = {}  # device_id -> connected
+#DEVICE CONNECTION LOGGING
+device_states = {}
 
 async def log_device_status_changes():
     while True:
@@ -194,7 +175,7 @@ async def log_device_status_changes():
             if latest:
                 ts = to_pht(latest["timestamp"])
                 diff = (now - ts).total_seconds()
-                connected = diff <= 5  # 5 seconds for connected
+                connected = diff <= 10
 
             last_state = device_states.get(d["device_id"])
             if last_state != connected:
@@ -204,9 +185,7 @@ async def log_device_status_changes():
 
         await asyncio.sleep(1)
 
-# =======================
 #   LIFECYCLE
-# =======================
 @app.on_event("startup")
 async def startup():
     await database.connect()
@@ -220,9 +199,7 @@ async def shutdown():
 async def health_check():
     return {"status": "ok", "db": DATABASE_URL}
 
-# =======================
-#   USER ROUTES
-# =======================
+#USER ROUTES
 @app.post("/api/register")
 async def register(u: UserCreate):
     if await get_user_by_username(u.username):
@@ -250,9 +227,7 @@ async def get_me(current_user=Depends(get_current_user)):
         "is_admin": current_user["is_admin"],
     }
 
-# =======================
-#   DEVICE ROUTES
-# =======================
+# DEVICE ROUTES
 @app.post("/api/devices/register")
 async def register_device(d: DeviceRegister, current_user=Depends(get_current_user)):
     my_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
@@ -319,9 +294,7 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
     await database.execute(devices.delete().where(devices.c.id == row["id"]))
     return {"status": "deleted", "device_id": device_id}
 
-# =======================
-#   DEVICE HISTORY
-# =======================
+#DEVICE HISTORY
 @app.get("/api/devices/{device_id}", response_model=List[dict])
 async def get_device_history(device_id: str, current_user=Depends(get_current_user)):
     r = await database.fetch_one(
@@ -354,9 +327,7 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
     return result
 
 
-# =======================
-#   SEIZURE EVENTS
-# =======================
+# SEIZURE EVENTS
 @app.get("/api/seizure_events")
 async def get_seizure_events(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(
@@ -381,7 +352,7 @@ async def get_latest_event(current_user=Depends(get_current_user)):
     if not row:
         return {}
     return {
-        "timestamp": to_pht(row["timestamp"]).strftime("%I:%M %p"),
+        "timestamp": to_pht(row["timestamp"]).isoformat(),
         "device_ids": row["device_ids"].split(",")
     }
 
@@ -392,13 +363,11 @@ async def get_all_seizure_events(current_user=Depends(get_current_user)):
         seizure_events.select().order_by(seizure_events.c.timestamp.desc())
     )
     return [{
-        "timestamp": to_pht(r["timestamp"]).strftime("%I:%M %p"),
+        "timestamp": to_pht(r["timestamp"]).isoformat(),
         "device_ids": r["device_ids"].split(",")
     } for r in rows]
 
-# =======================
-#   ESP32 UPLOAD
-# =======================
+#DEVICE UPLOAD
 @app.post("/api/device/upload")
 async def upload_from_esp(payload: UnifiedESP32Payload):
     existing = await database.fetch_one(
@@ -473,9 +442,7 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
 
     return {"status": "saved"}
 
-# =======================
-#   DEVICES + LATEST SENSOR DATA
-# =======================
+# LATEST SENSOR DATA
 @app.get("/api/mydevices_with_latest_data")
 async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
     user_devices = await database.fetch_all(
@@ -513,16 +480,11 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
     return output
 
 
-# =======================
-#   ROOT
-# =======================
+
 @app.get("/")
 async def root():
     return {"message": "Backend running"}
 
-# =======================
-#   RUN
-# =======================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
