@@ -307,6 +307,19 @@ async def admin_get_device_history(device_id: str, current_user=Depends(get_curr
 
     return result
 
+@app.delete("/api/delete_user/{user_id}")
+async def delete_user(user_id: int, current_user=Depends(get_current_user)):
+    if not current_user["is_admin"]:
+        raise HTTPException(status_code=403, detail="Admins only")
+
+    user = await database.fetch_one(users.select().where(users.c.id == user_id))
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    query = users.delete().where(users.c.id == user_id)
+    await database.execute(query)
+    
+    return {"detail": f"User {user['username']} deleted successfully"}
 
 #USER ROUTES
 @app.post("/api/register")
@@ -508,7 +521,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         ts_val = ts_val / 1000.0
     ts_utc = datetime.utcfromtimestamp(ts_val).replace(tzinfo=timezone.utc)
 
-    # Save sensor_data
     await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts_utc,
@@ -519,14 +531,12 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         seizure_flag=payload.seizure_flag
     ))
 
-    # Save raw device_data
     await database.execute(device_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts_utc,
         payload=json.dumps(payload.dict())
     ))
 
-    # --- Individual device session ---
     active_device = await get_active_device_seizure(payload.device_id)
     if payload.seizure_flag:
         if not active_device:
@@ -545,12 +555,10 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
                 .values(end_time=ts_utc)
             )
 
-    # --- User-wide seizure session logic ---
     user_id = existing["user_id"]
     user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == user_id))
     device_ids = [d["device_id"] for d in user_devices]
 
-    # Get latest reading per device
     recent_rows = []
     for did in device_ids:
         row = await database.fetch_one(
@@ -564,9 +572,7 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
 
     triggered_count = sum(1 for r in recent_rows if r["seizure_flag"])
 
-    # GTCS logic
     if triggered_count >= 3:
-        # Start GTCS session
         active_session = await get_active_user_seizure(user_id, "GTCS")
         if not active_session:
             await database.execute(user_seizure_sessions.insert().values(
@@ -575,14 +581,12 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
                 start_time=ts_utc,
                 end_time=None
             ))
-        # End Jerk session if exists
         jerk_session = await get_active_user_seizure(user_id, "Jerk")
         if jerk_session:
             await database.execute(user_seizure_sessions.update()
                                    .where(user_seizure_sessions.c.id == jerk_session["id"])
                                    .values(end_time=ts_utc))
     elif triggered_count >= 1:
-        # Start Jerk session
         active_session = await get_active_user_seizure(user_id, "Jerk")
         if not active_session:
             await database.execute(user_seizure_sessions.insert().values(
@@ -591,14 +595,12 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
                 start_time=ts_utc,
                 end_time=None
             ))
-        # End GTCS session if exists
         gtcs_session = await get_active_user_seizure(user_id, "GTCS")
         if gtcs_session:
             await database.execute(user_seizure_sessions.update()
                                    .where(user_seizure_sessions.c.id == gtcs_session["id"])
                                    .values(end_time=ts_utc))
     else:
-        # End all sessions if no seizure_flag
         for stype in ["GTCS", "Jerk"]:
             session = await get_active_user_seizure(user_id, stype)
             if session:
