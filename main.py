@@ -218,7 +218,6 @@ async def log_device_status_changes():
 
         await asyncio.sleep(1)
 
-#   LIFECYCLE
 @app.on_event("startup")
 async def startup():
     await database.connect()
@@ -231,6 +230,83 @@ async def shutdown():
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok", "db": DATABASE_URL}
+
+# ADMIN ROUTES
+@app.get("/api/users")
+async def get_all_users(current_user=Depends(get_current_user)):
+    if not current_user["is_admin"]:
+        raise HTTPException(status_code=403, detail="Admins only")
+
+    rows = await database.fetch_all(users.select())
+    result = []
+    for r in rows:
+        result.append({
+            "id": r["id"],
+            "username": r["username"],
+            "is_admin": r["is_admin"],
+        })
+
+    return result
+
+
+@app.get("/api/admin/user/{user_id}/devices")
+async def admin_get_user_devices(user_id: int, current_user=Depends(get_current_user)):
+    if not current_user["is_admin"]:
+        raise HTTPException(status_code=403, detail="Admins only")
+
+    rows = await database.fetch_all(
+        devices.select().where(devices.c.user_id == user_id)
+    )
+    return rows
+
+
+@app.get("/api/admin/user/{user_id}/events")
+async def admin_get_user_events(user_id: int, current_user=Depends(get_current_user)):
+    if not current_user["is_admin"]:
+        raise HTTPException(status_code=403, detail="Admins only")
+
+    rows = await database.fetch_all(
+        user_seizure_sessions.select()
+        .where(user_seizure_sessions.c.user_id == user_id)
+        .order_by(user_seizure_sessions.c.start_time.desc())
+    )
+
+    result = []
+    for r in rows:
+        result.append({
+            "type": r["type"],
+            "start": ts_pht_iso(r["start_time"]),
+            "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
+        })
+    return result
+
+
+@app.get("/api/admin/device/{device_id}/history")
+async def admin_get_device_history(device_id: str, current_user=Depends(get_current_user)):
+    if not current_user["is_admin"]:
+        raise HTTPException(status_code=403, detail="Admins only")
+
+    rows = await database.fetch_all(
+        device_data.select()
+        .where(device_data.c.device_id == device_id)
+        .order_by(device_data.c.timestamp.desc())
+        .limit(500)
+    )
+
+    result = []
+    for row in rows:
+        payload = json.loads(row["payload"])
+        result.append({
+            "timestamp": ts_pht_iso(row["timestamp"]),
+            "mag_x": payload.get("mag_x"),
+            "mag_y": payload.get("mag_y"),
+            "mag_z": payload.get("mag_z"),
+            "battery_percent": payload.get("battery_percent"),
+            "seizure_flag": payload.get("seizure_flag"),
+        })
+
+    return result
+
 
 #USER ROUTES
 @app.post("/api/register")
