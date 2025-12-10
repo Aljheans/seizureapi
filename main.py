@@ -281,8 +281,8 @@ async def admin_get_user_events(user_id: int, current_user=Depends(get_current_u
     for r in rows:
         result.append({
             "type": r["type"],
-            "start": format_pht_human(r["start_time"]),
-            "end": format_pht_human(r["end_time"]) if r["end_time"] else None
+            "start": ts_pht_iso(r["start_time"]),
+            "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
         })
     return result
 
@@ -343,8 +343,8 @@ async def get_seizure_events(current_user=Depends(get_current_user)):
     )
     result = []
     for r in rows:
-        start = format_pht_human(r["start_time"])
-        end = format_pht_human(r["end_time"]) if r["end_time"] else None
+        start = ts_pht_iso(r["start_time"])
+        end = ts_pht_iso(r["end_time"]) if r["end_time"] else None
         result.append({
             "type": r["type"],
             "start": start,
@@ -364,8 +364,8 @@ async def get_latest_event(current_user=Depends(get_current_user)):
         r = rows[0]
         return {
             "type": r["type"],
-            "start": format_pht_human(r["start_time"]),
-            "end": format_pht_human(r["end_time"]) if r["end_time"] else None
+            "start": ts_pht_iso(r["start_time"]),
+            "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
         }
     return {}
 
@@ -380,8 +380,8 @@ async def get_all_seizure_events(current_user=Depends(get_current_user)):
     for r in rows:
         result.append({
             "type": r["type"],
-            "start": format_pht_human(r["start_time"]),
-            "end": format_pht_human(r["end_time"]) if r["end_time"] else None
+            "start": ts_pht_iso(r["start_time"]),
+            "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
         })
     return result
 
@@ -442,8 +442,8 @@ async def get_last_gtcs(current_user=Depends(get_current_user)):
 
     return {
         "type": "GTCS",
-        "start": format_pht_human(row["start_time"]),
-        "end": format_pht_human(row["end_time"])
+        "start": ts_pht_iso(row["start_time"]),
+        "end": ts_pht_iso(row["end_time"]) if row["end_time"] else None
     }
 
 # DEVICE ROUTES
