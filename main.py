@@ -491,7 +491,8 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
 
 #DEVICE HISTORY
 def ts_pht_iso(dt_utc: datetime) -> str:
-    return to_pht(dt_utc).isoformat()
+    dt_pht = to_pht(dt_utc)
+    return dt_pht.strftime("%Y-%m-%dT%H:%M:%S")
 
 @app.get("/api/devices/{device_id}", response_model=List[dict])
 async def get_device_history(device_id: str, current_user=Depends(get_current_user)):
