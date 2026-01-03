@@ -12,6 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 from typing import Optional
 from sqlalchemy import and_
+from fastapi.responses import StreamingResponse
+import csv
+import io
+
 
 PHT = timezone(timedelta(hours=8))
 
@@ -686,6 +690,44 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
         })
     return output
 
+# DOWNLOAD ROUTE
+@app.get("/api/seizure_events/download")
+async def download_seizure_history(current_user=Depends(get_current_user)):
+    rows = await database.fetch_all(
+        user_seizure_sessions.select()
+        .where(user_seizure_sessions.c.user_id == current_user["id"])
+        .order_by(user_seizure_sessions.c.start_time.desc())
+    )
+
+    def generate_csv():
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Type", "Start Time (PHT)", "End Time (PHT)", "Duration (seconds)"])
+
+        for r in rows:
+            start = to_pht(r["start_time"])
+            end = to_pht(r["end_time"]) if r["end_time"] else None
+            duration = int((end - start).total_seconds()) if end else ""
+
+            writer.writerow([
+                r["type"],
+                start.strftime("%Y-%m-%d %H:%M:%S"),
+                end.strftime("%Y-%m-%d %H:%M:%S") if end else "Ongoing",
+                duration
+            ])
+
+        output.seek(0)
+        return output
+
+    filename = f"seizure_history_{datetime.now(PHT).strftime('%Y%m%d_%H%M%S')}.csv"
+
+    return StreamingResponse(
+        generate_csv(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}"
+        }
+    )
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
